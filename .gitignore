@@ -1,0 +1,36 @@
+# Byte-compiled / cache
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Environments
+.venv/
+venv/
+env/
+
+# Test / coverage
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Large external assets (see README for download instructions)
+datasets/
+checkpoints/
+artifacts/
+
+# Experiment outputs (only retained model weights are versioned)
+results/*
+!results/sae_retrain/
+!results/sae_retrain/**
+!results/*.md
+
+# Logs
+*.log
+slurm_log/
+slurm-*.out
+
+# Editors / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
