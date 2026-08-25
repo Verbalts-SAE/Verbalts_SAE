@@ -11,7 +11,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from contsg.models.sae_module import TopKSparseAutoencoder
-from sae.visualize_variants import SHAPE_NAMES, STAGE_NAMES, parse_segment_shapes
+from sae.shapes import SHAPE_NAMES, STAGE_NAMES, parse_segment_shapes
 
 
 CLASSIFIER_SCHEMA_VERSION = 1

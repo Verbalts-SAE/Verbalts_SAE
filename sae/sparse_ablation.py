@@ -26,9 +26,9 @@ import numpy as np
 import torch
 
 from contsg.eval.metrics.segment import PeakValleyClassifier1D
-from sae.collect_activations import load_verbalts
-from sae.diagnose_h_dynamics import HClassifier, train_classifier
-from sae.evaluate_compositional_full import (
+from sae.activations import load_verbalts
+from sae.h_probe import HClassifier, train_classifier
+from sae.eval_guidance import (
     PURE_KEY,
     captions_to_targets,
     classify_curves,
@@ -36,9 +36,9 @@ from sae.evaluate_compositional_full import (
     compute_mse_report,
     generate_variant,
 )
-from sae.latent_classifier import load_activation_cache, load_classifier_checkpoint
-from sae.visualize_variants import SHAPE_NAMES
-from sae.wrappers import (
+from sae.shape_classifier import load_activation_cache, load_classifier_checkpoint
+from sae.shapes import SHAPE_NAMES
+from sae.steering import (
     HGuidanceWrapper,
     LatentClassifierGuidanceWrapper,
     load_sae_checkpoint,

@@ -124,14 +124,14 @@ included under `results/sae_retrain/` (see below).
 
 ```bash
 # 1. collect residual-layer-1 activations of Pure VerbalTS on synth-u
-python -m sae.collect_activations --checkpoint artifacts/no_sae_pure_verbalts/verbalts.ckpt \
+python -m sae.activations --checkpoint artifacts/no_sae_pure_verbalts/verbalts.ckpt \
   --dataset synth-u --t-start 5 --t-end 45 --output-dir results/sae_retrain/activations
 
 # 2. train the Top-K SAE (fixed t=5–45 recipe)
 bash sae/training/train_t5_45.sh
 
 # 3. train the position-aware segment-shape classifier on SAE latents
-python -m sae.train_latent_classifier
+python -m sae.train_classifier
 ```
 
 ## Steering (classifier guidance on SAE latents)
@@ -140,19 +140,19 @@ Two ready-made evaluation entry points:
 
 ```bash
 # dense full-dim guidance (hybrid13, gamma=6 eta=2560)
-python -m sae.evaluate_compositional_full \
+python -m sae.eval_guidance \
   --mode guidance --windows t5_45 --strengths 2560 \
   --guidance-adaptive 6.0 --guidance-full-strength "double peaks,sag" \
   --output-dir results/compositional_guidance_hybrid13 --device cuda
 
 # sparse per-token top-32 guidance (sparse_dynamic_k32_eta5120)
-python -m sae.evaluate_control_variants \
+python -m sae.sparse_ablation \
   --mode sparse \
   --output-dir results/control_ablations/sparse --device cuda
 ```
 
 The guidance operator lives in
-[`sae/wrappers.py`](sae/wrappers.py) (`LatentClassifierGuidanceWrapper`):
+[`sae/steering.py`](sae/steering.py) (`LatentClassifierGuidanceWrapper`):
 `z ← relu(z − clamp(η · ∇_z mean_stage(−log p_target)))` with σ-relative step
 capping, confidence-weighted (`1 − p)^γ` shape scaling, and optional per-token
 top-k sparsification (`topk_mode="dynamic"`).
@@ -162,7 +162,7 @@ top-k sparsification (`topk_mode="dynamic"`).
 ```text
 contsg/          # ConTSG-Bench core: registry, data modules, VerbalTS, eval
                  #   (training / evaluation / visualization pipeline)
-sae/             # Top-K SAE model wrapper, training, latent guidance wrappers
+sae/             # SAE training, steering, evaluation, visualization
 configs/         # synth-u training (VerbalTS) and CTTP evaluation configs
 results/         # retained weights + two conclusion documents
 pyproject.toml   # package metadata and dependencies

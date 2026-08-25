@@ -1,6 +1,7 @@
 # 归档实验结论总结（2026-08-22 清理时记录）
 
 > 本文件记录 `results/` 中被删除的中间探索实验的关键结论。
+> 注：本文档为历史归档，其中引用的旧脚本名已重命名（映射见 `sae/README.md` 的 Source layout）。
 > 所有实验均为 synth-u 全量测试集 n=4000（smoke 为子集），pure VerbalTS 基线：
 > **segment_accuracy=0.7778，MSE=0.9635，whole=0.5048，CTTP=46.34**。
 > 最终胜出方案见 `compositional_guidance_hybrid_final.md`（shape-aware hybrid classifier guidance，γ=6 η=2560，t5_45 单窗口）。

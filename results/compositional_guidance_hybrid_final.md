@@ -1,6 +1,6 @@
 # SAE Shape-Aware Hybrid Guidance — 最终汇总（synth-u 全量测试集 n=4000）
 
-日期：2026-08-22 生成。全部结果由 `sae/evaluate_compositional_full.py --mode guidance`
+日期：2026-08-22 生成。全部结果由 `sae/eval_guidance.py --mode guidance`
 （单窗口 t5_45，`--guidance-full-strength "double peaks,sag"`）产生。
 
 ## 基准（pure VerbalTS）
@@ -60,13 +60,13 @@
 
 ```
 # seg 最高（本文可视化所用）：γ=6, η=2560
-python -m sae.evaluate_compositional_full \
+python -m sae.eval_guidance \
   --mode guidance --windows t5_45 --strengths 2560 \
   --guidance-adaptive 6.0 --guidance-full-strength "double peaks,sag" \
   --output-dir results/compositional_guidance_hybrid13 --device cuda
 
 # 平衡推荐（MSE 代价最小）：γ=8, η=1280
-python -m sae.evaluate_compositional_full \
+python -m sae.eval_guidance \
   --mode guidance --windows t5_45 --strengths 1280 \
   --guidance-adaptive 8.0 --guidance-full-strength "double peaks,sag" \
   --output-dir results/compositional_guidance_hybrid14 --device cuda

@@ -11,7 +11,7 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader, TensorDataset
 
-from sae.latent_classifier import (
+from sae.shape_classifier import (
     CLASSIFIER_SCHEMA_VERSION,
     SAEClassClassifier,
     classifier_metrics,
@@ -20,7 +20,7 @@ from sae.latent_classifier import (
     weighted_classification_loss,
 )
 from sae.provenance import runtime_metadata, sha256_file, tensor_state_sha256, write_json
-from sae.wrappers import load_sae_checkpoint
+from sae.steering import load_sae_checkpoint
 
 
 def build_parser() -> argparse.ArgumentParser:

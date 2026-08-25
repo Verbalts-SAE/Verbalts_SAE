@@ -1,4 +1,4 @@
-"""Checkpoint loading and timestep-aware latent guidance wrappers."""
+"""Checkpoint loading and timestep-aware latent guidance steering."""
 
 from __future__ import annotations
 

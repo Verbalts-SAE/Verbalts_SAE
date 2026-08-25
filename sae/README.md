@@ -19,24 +19,25 @@ weights, and every mechanism-analysis artifact have been removed.
 
 Training pipeline (every stage writes provenance JSON):
 
-- `collect_activations.py`: reproducibly collect residual-layer activations.
+- `activations.py`: reproducibly load VerbalTS and collect residual-layer activations.
 - `training/train_sae.py` + `training/train_t5_45.sh`: fixed t=5–45 recipe.
-- `latent_classifier.py` + `train_latent_classifier.py`: position-aware
+- `shape_classifier.py` + `train_classifier.py`: position-aware
   3-by-4 segment-shape classifier on SAE latents.
 
 Evaluation / visualization:
 
-- `evaluate_compositional_full.py`: paired pure-vs-guidance generation and
+- `eval_guidance.py`: paired pure-vs-guidance generation and
   metrics (CTTP, MSE, segment CNN); entry point of the hybrid13 recipe.
-- `evaluate_control_variants.py`: dense-vs-sparse guidance ablations; entry
+- `sparse_ablation.py`: dense-vs-sparse guidance ablations; entry
   point of the `sparse_dynamic_k32_eta5120` recipe.
-- `visualize_variants.py`: pure-vs-SAE reconstruction comparison figures.
-- `diagnose_h_dynamics.py`: h-space classifier helper imported by the
+- `recon_viz.py`: pure-vs-SAE reconstruction comparison figures.
+- `h_probe.py`: h-space classifier helper imported by the
   evaluation scripts.
 
 Infrastructure:
 
-- `wrappers.py`: attach SAEs / guidance wrappers to VerbalTS (including the
+- `shapes.py`: shared segment-shape vocabulary and caption-parsing helpers.
+- `steering.py`: attach SAEs / guidance operators to VerbalTS (including the
   per-token top-k dynamic guidance mode).
 - `provenance.py`: SHA-256 + runtime metadata for every pipeline artifact.
 - `contsg/models/sae_module.py`: the pure Top-K architecture.
@@ -52,7 +53,7 @@ Shape-aware hybrid guidance in the t=5–45 window (dense full-512-dim latent
 gradient, gamma=6, eta=2560, full strength on "double peaks,sag"):
 
 ```bash
-python -m sae.evaluate_compositional_full \
+python -m sae.eval_guidance \
   --mode guidance --windows t5_45 --strengths 2560 \
   --guidance-adaptive 6.0 --guidance-full-strength "double peaks,sag" \
   --output-dir results/compositional_guidance_hybrid13 --device cuda
@@ -70,7 +71,7 @@ Same hybrid recipe but the guidance step is truncated to the top-32 largest
 per-token latent moves each diffusion step (the other 480 dims stay frozen):
 
 ```bash
-python -m sae.evaluate_control_variants \
+python -m sae.sparse_ablation \
   --mode sparse \
   --output-dir results/control_ablations/sparse --device cuda
 ```
@@ -91,7 +92,7 @@ n=4000 multi-seed confirmation is pending.
 Run the reproducible synth-u visualization pipeline from the repository root:
 
 ```bash
-python -m sae.visualize_variants
+python -m sae.recon_viz
 ```
 
 The pipeline generates a deterministic pool of 128 shape-rich test
@@ -108,7 +109,7 @@ rather than target-directed feature steering.
 ## Loading
 
 ```python
-from sae.wrappers import attach_sae, detach_sae
+from sae.steering import attach_sae, detach_sae
 
 # model is an already loaded VerbalTSModule.
 attach_sae(model, "results/sae_retrain/models/t5_45/best.pt")

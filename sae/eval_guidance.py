@@ -32,17 +32,17 @@ import numpy as np
 import torch
 
 from contsg.eval.metrics.segment import PeakValleyClassifier1D
-from sae.collect_activations import load_verbalts
-from sae.latent_classifier import load_classifier_checkpoint
+from sae.activations import load_verbalts
+from sae.shape_classifier import load_classifier_checkpoint
 from sae.provenance import runtime_metadata, sha256_file, tensor_state_sha256, write_json
-from sae.visualize_variants import (
+from sae.shapes import (
     SHAPE_NAMES,
     SHAPE_TO_TARGET,
     STAGE_NAMES,
     captions_to_targets,
     classify_curves,
 )
-from sae.wrappers import LatentClassifierGuidanceWrapper, load_sae_checkpoint
+from sae.steering import LatentClassifierGuidanceWrapper, load_sae_checkpoint
 
 # Import for the Registry side effect.
 import contsg.models.verbalts  # noqa: F401, E402
