@@ -77,3 +77,54 @@ def test_ig_completeness_on_tiny_classifier() -> None:
     logp_0 = classifier(torch.zeros_like(z)).log_softmax(-1)[:, 0, 1].detach()
     error = (ig.sum(dim=-1).mean(dim=1) - (logp_z - logp_0)).abs().max().item()
     assert error < 0.15
+
+
+def test_multi_hit_samples_merge_ratios_multiplicatively() -> None:
+    torch.manual_seed(0)
+    sae = TopKSparseAutoencoder(input_dim=4, latent_dim=8, topk_k=3)
+    edits = {
+        "beginning/single peak": {"boost": [1], "suppress": [5]},
+        "end/double peaks": {"boost": [5], "suppress": [1]},
+        "middle/sag": {"boost": [5]},
+    }
+    wrapper = MultiplicativeSteeringWrapper(sae, (0, 3), edits, 2.0, 0.5)
+    hidden = torch.randn(9, 4)
+    steps = torch.tensor([1, 1, 1])
+    # s0 hits groups A+B (opposing roles on dims 1 and 5), s1 hits B,
+    # s2 hits C+B (same-direction boost on dim 5 stacks, then clamps).
+    wrapper.set_targets(torch.tensor([[1, 0, 2], [0, 0, 2], [0, 3, 2]]))
+    transformed, latents = wrapper(hidden, steps)
+
+    z = sae.encode(hidden.view(3, 3, 4)).detach()
+    # s0: 2.0 * 0.5 == 1.0 on both dims -> net identity edit.
+    assert torch.allclose(latents[0:3], z[0])
+    # s1: dim1 suppressed, dim5 boosted.
+    assert torch.allclose(latents[3:6, 1], z[1, :, 1] * 0.5)
+    assert torch.allclose(latents[3:6, 5], z[1, :, 5] * 2.0)
+    # s2: dim5 stacked 2.0 * 2.0 = 4.0 -> default clamp caps at 2.0.
+    assert torch.allclose(latents[6:9, 1], z[2, :, 1] * 0.5)
+    assert torch.allclose(latents[6:9, 5], z[2, :, 5] * 2.0)
+    assert torch.allclose(transformed, sae.decode(latents))
+
+    audit = wrapper.audit()
+    assert audit["multi_hit_samples"] == 2
+    assert audit["steered_samples"] == 3
+    assert audit["steered_rows"] == 9
+
+
+def test_multi_hit_stacking_with_explicit_clamp() -> None:
+    torch.manual_seed(0)
+    sae = TopKSparseAutoencoder(input_dim=4, latent_dim=8, topk_k=3)
+    edits = {
+        "beginning/single peak": {"boost": [2]},
+        "end/double peaks": {"boost": [2]},
+    }
+    wrapper = MultiplicativeSteeringWrapper(
+        sae, (0, 3), edits, 2.0, 0.5, max_ratio=8.0, min_ratio=0.25
+    )
+    hidden = torch.randn(3, 4)
+    wrapper.set_targets(torch.tensor([[1, 0, 2]]))
+    _, latents = wrapper(hidden, torch.tensor([1]))
+    z = sae.encode(hidden.view(1, 3, 4)).detach()
+    assert torch.allclose(latents[:, 2], z[0, :, 2] * 4.0)
+    assert wrapper.audit()["multi_hit_samples"] == 1

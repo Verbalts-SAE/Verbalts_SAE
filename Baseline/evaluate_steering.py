@@ -127,6 +127,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="Multiplier applied to the top-k negative-IG dims",
     )
     parser.add_argument(
+        "--max-ratio",
+        type=float,
+        default=None,
+        help="Upper clamp for merged multiplicative ratios (default: max(1, boost-factor))",
+    )
+    parser.add_argument(
+        "--min-ratio",
+        type=float,
+        default=None,
+        help="Lower clamp for merged multiplicative ratios (default: min(1, suppress-factor))",
+    )
+    parser.add_argument(
         "--evaluation-cnn",
         type=Path,
         default=(
@@ -250,6 +262,8 @@ def main(argv: Sequence[str] | None = None) -> None:
         edits,
         boost_factor=args.boost_factor,
         suppress_factor=args.suppress_factor,
+        max_ratio=args.max_ratio,
+        min_ratio=args.min_ratio,
     ).to(device).eval()
     wrappers = {STEERED_KEY: wrapper}
     variant_keys = (PURE_KEY, STEERED_KEY)

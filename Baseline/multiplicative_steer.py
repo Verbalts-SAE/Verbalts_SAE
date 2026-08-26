@@ -14,6 +14,14 @@ classifier-guidance pipeline.  A pure multiplication leaves inactive
 (``z == 0``) boost dims untouched — exactly the DiffLens "multiply_all"
 recipe.  Samples whose caption does not target any located class keep the
 unmodified SAE reconstruction.
+
+Multi-class conflicts: when one sample's caption targets several edited
+groups (e.g. "Beginning: single peak" and "End: double peaks"), the group
+ratio vectors are merged by per-dimension multiplication, then clamped to
+``[min_ratio, max_ratio]``.  Opposing roles cancel exactly
+(2.0 * 0.5 == 1.0) while same-direction edits never stack beyond a single
+group's strength by default.  Merged samples are counted in
+``audit()["multi_hit_samples"]``.
 """
 
 from __future__ import annotations
@@ -52,9 +60,11 @@ class MultiplicativeSteeringWrapper(TimestepSAEWrapper):
     dimension lists ``{"boost": [...], "suppress": [...]}`` located by
     :mod:`Baseline.ig_attribution`.  Every group gets its own ratio vector
     (ones everywhere except the edited dims); at forward time a sample uses
-    the ratio vector of the group its caption targets.  Ambiguous samples
-    (targeting several edited groups at once) raise ``ValueError`` instead of
-    silently applying the wrong edit.
+    the ratio vector of the group its caption targets.  A sample targeting
+    several edited groups merges the group ratios by per-dimension
+    multiplication and then clamps to ``[min_ratio, max_ratio]``: opposing
+    roles on a dim cancel exactly (2.0 * 0.5 == 1.0) while same-direction
+    edits never stack beyond a single group's strength by default.
     """
 
     def __init__(
@@ -64,6 +74,8 @@ class MultiplicativeSteeringWrapper(TimestepSAEWrapper):
         edits: Mapping[str, Mapping[str, Sequence[int]]],
         boost_factor: float = 2.0,
         suppress_factor: float = 0.5,
+        max_ratio: float | None = None,
+        min_ratio: float | None = None,
     ) -> None:
         # Set audit counters before super().__init__: TimestepSAEWrapper's
         # constructor calls self.reset_audit(), which the override below
@@ -71,6 +83,7 @@ class MultiplicativeSteeringWrapper(TimestepSAEWrapper):
         self.steered_samples = 0
         self.steered_rows = 0
         self.delta_sum = 0.0
+        self.multi_hit_samples = 0
         super().__init__(sae, t_range)
 
         self.boost_factor = float(boost_factor)
@@ -79,6 +92,19 @@ class MultiplicativeSteeringWrapper(TimestepSAEWrapper):
             raise ValueError("boost_factor must be positive")
         if self.suppress_factor < 0.0:
             raise ValueError("suppress_factor must be non-negative")
+        # Default clamp keeps merged ratios within a single group's strength:
+        # same-direction edits never stack beyond one edit, opposing edits
+        # cancel to 1.0.  Pass explicit values to widen or disable (None).
+        self.max_ratio = (
+            max(1.0, self.boost_factor) if max_ratio is None else float(max_ratio)
+        )
+        self.min_ratio = (
+            min(1.0, self.suppress_factor) if min_ratio is None else float(min_ratio)
+        )
+        if self.min_ratio > self.max_ratio:
+            raise ValueError(
+                f"min_ratio {self.min_ratio} must not exceed max_ratio {self.max_ratio}"
+            )
 
         self.group_ratios: dict[tuple[int, int], torch.Tensor] = {}
         for index, (key, spec) in enumerate(dict(edits).items()):
@@ -110,6 +136,7 @@ class MultiplicativeSteeringWrapper(TimestepSAEWrapper):
         self.steered_samples = 0
         self.steered_rows = 0
         self.delta_sum = 0.0
+        self.multi_hit_samples = 0
 
     def set_targets(self, target_classes: torch.Tensor) -> None:
         """Set caption-derived targets shaped ``(batch, 3)`` (shape id per stage)."""
@@ -131,6 +158,7 @@ class MultiplicativeSteeringWrapper(TimestepSAEWrapper):
         report["steered_samples"] = self.steered_samples
         report["steered_rows"] = self.steered_rows
         report["mean_abs_delta"] = self.delta_sum / max(self.steered_rows, 1)
+        report["multi_hit_samples"] = self.multi_hit_samples
         return report
 
     def forward(
@@ -162,14 +190,14 @@ class MultiplicativeSteeringWrapper(TimestepSAEWrapper):
             )
             for (stage, shape), ratio in self.group_ratios.items():
                 hit = targets[:, stage] == shape
-                conflict = hit & applied
-                if conflict.any():
-                    raise ValueError(
-                        "sample targets match multiple edited groups; the "
-                        "multiplicative edit is ambiguous"
-                    )
-                applied |= hit
-                ratio_table[hit] = ratio
+                if hit.any():
+                    multi = hit & applied
+                    self.multi_hit_samples += int(multi.sum())
+                    # Per-dimension multiplicative merge: opposing roles
+                    # cancel (2.0 * 0.5 == 1.0), same-direction roles stack.
+                    ratio_table[hit] = ratio_table[hit] * ratio.unsqueeze(0)
+                    applied |= hit
+            ratio_table.clamp_(min=self.min_ratio, max=self.max_ratio)
             steered = sample_latents.detach() * ratio_table.unsqueeze(1)
             if applied.any():
                 self.steered_samples += int(applied.sum())
