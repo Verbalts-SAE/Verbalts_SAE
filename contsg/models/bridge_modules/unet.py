@@ -457,6 +457,8 @@ class UNetModel(nn.Module):
         ):
 
         super().__init__()
+        # Optional steering hook applied after the middle block.
+        self.activation_transform = None
         # if use_spatial_transformer:
         #     assert context_dim is not None, 'Fool!! You forgot to include the dimension of your cross-attention conditioning...'
 
@@ -764,6 +766,12 @@ class UNetModel(nn.Module):
             hs.append(h)
 
         h = self.middle_block(h, emb, context_emb, mask=mask)
+
+        if self.activation_transform is not None:
+            batch_size, channels, n_tokens = h.shape
+            flattened = h.permute(0, 2, 1).reshape(-1, channels)
+            transformed, latents = self.activation_transform(flattened, timesteps)
+            h = transformed.reshape(batch_size, n_tokens, channels).permute(0, 2, 1).contiguous()
 
         for module in self.output_blocks:
             h = th.cat([h, hs.pop()], dim=1)

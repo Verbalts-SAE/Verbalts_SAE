@@ -94,6 +94,10 @@ from contsg.eval.metrics.segment import (
     SegmentParameterAccuracyMetric,
 )
 
+# Analytic Synth-Peak-FG adherence metric
+from contsg.eval.metrics import peak_fg
+from contsg.eval.metrics.peak_fg import PeakFGAccuracyMetric
+
 
 # ==============================================================================
 # Package Exports
@@ -111,6 +115,7 @@ __all__ = [
     "WAPEMetric",
     "EuclideanDistanceMetric",
     "CRPSMetric",
+    "PeakFGAccuracyMetric",
     # Statistical metrics
     "ACDMetric",
     "SkewnessDiffMetric",

@@ -837,6 +837,10 @@ def precompute_embeddings(
         "train,valid,test", "--splits", "-s",
         help="Comma-separated list of splits to process",
     ),
+    variants: str = typer.Option(
+        "base", "--variants", "-v",
+        help="Comma-separated caption variants (for example: sparse,full)",
+    ),
     batch_size: int = typer.Option(
         64, "--batch-size", "-b",
         help="Batch size for encoding",
@@ -878,7 +882,9 @@ def precompute_embeddings(
 
     # Parse splits
     split_list = [s.strip() for s in splits.split(",")]
+    variant_list = [v.strip() for v in variants.split(",")]
     console.print(f"[blue]Splits:[/blue] {split_list}")
+    console.print(f"[blue]Caption variants:[/blue] {variant_list}")
 
     # Create precomputer
     console.print("\n[blue]Loading embedding model...[/blue]")
@@ -894,6 +900,7 @@ def precompute_embeddings(
         dataset_dir=data_folder,
         precomputer=precomputer,
         splits=split_list,
+        variants=variant_list,
         batch_size=batch_size,
         overwrite=overwrite,
     )

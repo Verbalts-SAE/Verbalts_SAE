@@ -430,6 +430,11 @@ class DiffuSETSUNet(nn.Module):
         super().__init__()
         self.num_levels = num_levels
         assert kernel_size % 2 == 1, "Kernel size must be odd"
+        # Optional steering hook applied inside the down-path (before the bottleneck).
+        self.activation_transform = None
+        # Down-block index after which the hook fires; None keeps the legacy
+        # position (after the last down block, right before the bottleneck).
+        self.transform_block_index = None
 
         # Build channel lists
         input_ch = []
@@ -509,9 +514,17 @@ class DiffuSETSUNet(nn.Module):
         shortcuts = []
         out = x
 
-        for block in self.down_blocks:
+        for idx, block in enumerate(self.down_blocks):
             h, out = block(out, t, text_embed)
             shortcuts.append(h)
+            last_down = idx == len(self.down_blocks) - 1
+            hook_here = self.transform_block_index is None and last_down
+            hook_here = hook_here or idx == self.transform_block_index
+            if self.activation_transform is not None and hook_here:
+                batch_size, channels, n_tokens = out.shape
+                flattened = out.permute(0, 2, 1).reshape(-1, channels)
+                transformed, latents = self.activation_transform(flattened, t)
+                out = transformed.reshape(batch_size, n_tokens, channels).permute(0, 2, 1).contiguous()
         shortcuts.pop()
 
         out = self.bottleneck(out, t, text_embed)
@@ -689,6 +702,9 @@ class DiffuSETS(BaseGeneratorModule, DiffusionMixin):
 
     def encode(self, x: Tensor) -> Tuple[Tensor, Tensor, Tensor]:
         """Encode time series to latent space."""
+        pad = (-x.shape[1]) % 8
+        if pad:
+            x = F.pad(x, (0, 0, 0, pad), mode="replicate")
         return self.encoder(x)
 
     def decode(self, z: Tensor) -> Tensor:
@@ -732,7 +748,7 @@ class DiffuSETS(BaseGeneratorModule, DiffusionMixin):
             raise ValueError("DiffuSETS finetune requires 'cap_emb' in batch when use_condition=True.")
 
         with torch.no_grad():
-            z, _, _ = self.encoder(ts)
+            z, _, _ = self.encode(ts)
 
         # Sample timestep and noise
         t = torch.randint(0, self.num_steps, (B,), device=device)

@@ -16,6 +16,15 @@ from sae.shapes import SHAPE_NAMES, STAGE_NAMES, parse_segment_shapes
 
 CLASSIFIER_SCHEMA_VERSION = 1
 
+FINE_SHAPE_NAMES = (
+    "nothing",
+    "narrow single peak",
+    "wide single peak",
+    "narrow double peaks",
+    "wide double peaks",
+    "sag",
+)
+
 
 def captions_to_shape_ids(captions: np.ndarray) -> torch.Tensor:
     """Return caption-derived labels with shape ``(samples, 3)``."""
@@ -26,6 +35,15 @@ def captions_to_shape_ids(captions: np.ndarray) -> torch.Tensor:
         for caption in captions.reshape(-1)
     ]
     return torch.tensor(labels, dtype=torch.long)
+
+
+def shape_name_table(num_shape_classes: int) -> tuple[str, ...]:
+    """Display names for a classifier's shape classes (4 or 6 supported)."""
+    if num_shape_classes == len(SHAPE_NAMES):
+        return SHAPE_NAMES
+    if num_shape_classes == len(FINE_SHAPE_NAMES):
+        return FINE_SHAPE_NAMES
+    raise ValueError(f"unsupported num_shape_classes {num_shape_classes}")
 
 
 def class_group_key(stage_index: int, shape_index: int) -> str:
@@ -40,8 +58,24 @@ def iter_class_groups() -> list[tuple[int, int, str]]:
     ]
 
 
+def default_head_names(num_heads: int) -> tuple[str, ...]:
+    """Head display names: legacy three-stage names, 'beat' for one head."""
+    if num_heads == len(STAGE_NAMES):
+        return STAGE_NAMES
+    if num_heads == 1:
+        return ("beat",)
+    if num_heads == 4:
+        return ("first", "second", "third", "fourth")
+    return tuple(f"head_{index}" for index in range(num_heads))
+
+
 class SAEClassClassifier(nn.Module):
-    """Predict three four-way shape classes from position-aware SAE latents."""
+    """Predict four-way shape classes from position-aware SAE latents.
+
+    ``num_heads`` defaults to 3 (one head per concatenated stage) for
+    compatibility with existing three-stage checkpoints; single-beat datasets
+    pass ``num_heads=1``.
+    """
 
     def __init__(
         self,
@@ -51,12 +85,21 @@ class SAEClassClassifier(nn.Module):
         dropout: float = 0.1,
         input_mean: torch.Tensor | None = None,
         input_std: torch.Tensor | None = None,
+        num_heads: int | None = None,
+        num_shape_classes: int | None = None,
     ) -> None:
         super().__init__()
         self.latent_dim = int(latent_dim)
         self.tokens_per_sample = int(tokens_per_sample)
         self.hidden_dim = int(hidden_dim)
         self.dropout_probability = float(dropout)
+        self.num_heads = len(STAGE_NAMES) if num_heads is None else int(num_heads)
+        self.num_shape_classes = len(SHAPE_NAMES) if num_shape_classes is None else int(num_shape_classes)
+        if self.num_shape_classes not in (len(SHAPE_NAMES), len(FINE_SHAPE_NAMES)):
+            raise ValueError(f"unsupported num_shape_classes {self.num_shape_classes}")
+        if self.num_heads < 1:
+            raise ValueError("num_heads must be positive")
+        self.head_names = default_head_names(self.num_heads)
         if input_mean is None:
             input_mean = torch.zeros(self.latent_dim)
         if input_std is None:
@@ -67,9 +110,9 @@ class SAEClassClassifier(nn.Module):
         self.position_embedding = nn.Parameter(
             torch.empty(self.tokens_per_sample, self.hidden_dim)
         )
-        self.stage_queries = nn.Parameter(torch.empty(len(STAGE_NAMES), self.hidden_dim))
+        self.stage_queries = nn.Parameter(torch.empty(self.num_heads, self.hidden_dim))
         self.dropout = nn.Dropout(self.dropout_probability)
-        self.output = nn.Linear(self.hidden_dim, len(SHAPE_NAMES))
+        self.output = nn.Linear(self.hidden_dim, self.num_shape_classes)
         nn.init.normal_(self.position_embedding, std=0.02)
         nn.init.normal_(self.stage_queries, std=0.02)
 
@@ -97,12 +140,15 @@ class SAEClassClassifier(nn.Module):
 
 def load_activation_cache(
     cache_path: str | Path,
-    captions_path: str | Path,
+    labels_path: str | Path,
+    labels_from_attrs: bool = False,
+    num_heads: int | None = None,
+    num_shape_classes: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict[str, Any]]:
     """Load ordered activation rows and restore sample/token boundaries."""
 
     cache_path = Path(cache_path).resolve()
-    captions_path = Path(captions_path).resolve()
+    labels_path = Path(labels_path).resolve()
     payload = torch.load(cache_path, map_location="cpu", weights_only=False)
     required = {"activations", "t_values", "audit", "t_range"}
     missing = required.difference(payload)
@@ -119,11 +165,23 @@ def load_activation_cache(
     sample_steps = timesteps.reshape(sample_count, tokens_per_sample)
     if not torch.all(sample_steps == sample_steps[:, :1]):
         raise ValueError("tokens belonging to one sample have inconsistent timesteps")
-    captions = np.load(captions_path, allow_pickle=True)
-    labels = captions_to_shape_ids(captions)
-    if labels.shape != (sample_count, len(STAGE_NAMES)):
+    heads = len(STAGE_NAMES) if num_heads is None else int(num_heads)
+    if heads < 1:
+        raise ValueError("num_heads must be positive")
+    num_classes = len(SHAPE_NAMES) if num_shape_classes is None else int(num_shape_classes)
+    raw_labels = np.load(labels_path, allow_pickle=not labels_from_attrs)
+    if labels_from_attrs:
+        if raw_labels.ndim != 2 or raw_labels.shape[1] != heads:
+            raise ValueError(
+                f"attribute labels must have shape (samples, {heads}), got {raw_labels.shape}")
+        if np.any((raw_labels < 0) | (raw_labels >= num_classes)):
+            raise ValueError(f"attribute morphology labels must be in [0, {num_classes - 1}]")
+        labels = torch.from_numpy(raw_labels.astype(np.int64, copy=False)).long()
+    else:
+        labels = captions_to_shape_ids(raw_labels)
+    if labels.shape != (sample_count, heads):
         raise ValueError(
-            f"caption labels {tuple(labels.shape)} do not match {sample_count} cached samples"
+            f"labels {tuple(labels.shape)} do not match {sample_count} cached samples"
         )
     samples = activations.reshape(sample_count, tokens_per_sample, activations.shape[-1])
     return samples, sample_steps[:, 0], labels, payload
@@ -161,9 +219,9 @@ def weighted_classification_loss(
     class_weights: torch.Tensor | None = None,
 ) -> torch.Tensor:
     losses = []
-    for stage in range(len(STAGE_NAMES)):
-        weight = None if class_weights is None else class_weights[stage]
-        losses.append(F.cross_entropy(logits[:, stage], labels[:, stage], weight=weight))
+    for head in range(logits.shape[1]):
+        weight = None if class_weights is None else class_weights[head]
+        losses.append(F.cross_entropy(logits[:, head], labels[:, head], weight=weight))
     return torch.stack(losses).mean()
 
 
@@ -185,25 +243,31 @@ def classifier_metrics(
     predicted = torch.cat(predictions)
     probabilities = torch.cat(probability_parts)
     matches = predicted == labels
+    head_names = model.head_names
+    shape_names = shape_name_table(model.num_shape_classes)
     groups: dict[str, Any] = {}
-    for stage, shape, key in iter_class_groups():
-        support = labels[:, stage] == shape
-        predicted_support = predicted[:, stage] == shape
-        true_positive = int((support & predicted_support).sum())
-        groups[key] = {
-            "support": int(support.sum()),
-            "accuracy_on_support": float(matches[support, stage].float().mean()) if support.any() else 0.0,
-            "precision": true_positive / max(int(predicted_support.sum()), 1),
-            "mean_target_probability_on_support": (
-                float(probabilities[support, stage, shape].mean()) if support.any() else 0.0
-            ),
-        }
+    for head in range(model.num_heads):
+        for shape in range(model.num_shape_classes):
+            key = f"{head_names[head].lower()}/{shape_names[shape]}"
+            support = labels[:, head] == shape
+            predicted_support = predicted[:, head] == shape
+            true_positive = int((support & predicted_support).sum())
+            groups[key] = {
+                "support": int(support.sum()),
+                "accuracy_on_support": float(matches[support, head].float().mean()) if support.any() else 0.0,
+                "precision": true_positive / max(int(predicted_support.sum()), 1),
+                "mean_target_probability_on_support": (
+                    float(probabilities[support, head, shape].mean()) if support.any() else 0.0
+                ),
+            }
     return {
+        "accr": float(matches.all(dim=1).float().mean()),
+        "num_heads": model.num_heads,
         "joint_three_stage_accuracy": float(matches.all(dim=1).float().mean()),
         "mean_stage_accuracy": float(matches.float().mean()),
         "stage_accuracy": {
-            STAGE_NAMES[stage].lower(): float(matches[:, stage].float().mean())
-            for stage in range(len(STAGE_NAMES))
+            head_names[head].lower(): float(matches[:, head].float().mean())
+            for head in range(model.num_heads)
         },
         "groups": groups,
         "samples": len(features),
@@ -225,6 +289,8 @@ def load_classifier_checkpoint(
         dropout=float(checkpoint["dropout"]),
         input_mean=checkpoint["input_mean"],
         input_std=checkpoint["input_std"],
+        num_heads=int(checkpoint.get("num_heads", len(STAGE_NAMES))),
+        num_shape_classes=int(checkpoint.get("num_shape_classes", len(SHAPE_NAMES))),
     )
     model.load_state_dict(checkpoint["state_dict"], strict=True)
     return model.to(device).eval(), checkpoint

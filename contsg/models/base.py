@@ -196,7 +196,11 @@ class BaseGeneratorModule(LabelExtractionMixin, pl.LightningModule):
         self._learning_rate = learning_rate  # Per-stage LR override
 
         self.save_hyperparameters({
-            "config": config.model_dump(mode="json"),
+            # ``ExperimentConfig.model`` is annotated as the extensible base
+            # class and replaced by a model-specific subclass at validation
+            # time.  Without serialize_as_any, Pydantic drops subclass fields
+            # (for example VerbalTS' diffusion schedule) from checkpoints.
+            "config": config.model_dump(mode="json", serialize_as_any=True),
             "use_condition": use_condition,
             "learning_rate": learning_rate,
         })

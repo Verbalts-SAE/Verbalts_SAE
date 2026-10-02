@@ -25,7 +25,7 @@ class DatasetMeta:
 
 
 # ---------------------------------------------------------------------------
-# Canonical dataset metadata (10 benchmark datasets)
+# Canonical dataset metadata
 # ---------------------------------------------------------------------------
 
 DATASET_META: Dict[str, DatasetMeta] = {
@@ -43,6 +43,14 @@ DATASET_META: Dict[str, DatasetMeta] = {
         domain="synthetic",
         semantic_level="morphological",
         description="Synthetic univariable dataset with diverse patterns and natural language descriptions.",
+        n_var=1,
+        seq_length=128,
+    ),
+    "synth-peak-fg": DatasetMeta(
+        name="synth-peak-fg",
+        domain="synthetic",
+        semantic_level="morphological",
+        description="Shared-background univariate series with independent early, middle, and late 9-way triangular peak types.",
         n_var=1,
         seq_length=128,
     ),

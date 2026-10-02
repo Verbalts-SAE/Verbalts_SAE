@@ -13,7 +13,6 @@ import torch
 from torch.utils.data import DataLoader, Subset
 from tqdm.auto import tqdm
 
-import contsg.data.datasets.standard  # noqa: F401
 import contsg.models.verbalts  # noqa: F401
 from contsg.config.schema import ExperimentConfig
 from contsg.data.datamodule import TimeSeriesDataset
@@ -63,6 +62,38 @@ def load_verbalts(checkpoint_path: Path, device: torch.device) -> tuple[torch.nn
     model.load_state_dict(checkpoint["state_dict"], strict=True)
     state_hash = tensor_state_sha256(model.state_dict())
     return model.to(device).eval(), state_hash
+
+
+def load_generator(
+    checkpoint_path: Path, device: torch.device
+) -> tuple[torch.nn.Module, str]:
+    """Load any registered generator (verbalts / diffusets / bridge).
+
+    Returns ``(model, model_name)``.  The VerbalTS-specific config fixups from
+    ``load_verbalts`` are kept for that model; the other generators rebuild
+    directly from the embedded config.
+    """
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    hparams = checkpoint.get("hyper_parameters", {})
+    config_dict = copy.deepcopy(hparams.get("config", {}))
+    if not config_dict:
+        raise ValueError(f"checkpoint has no embedded hyper_parameters.config: {checkpoint_path}")
+    model_cfg = config_dict.get("model", {})
+    model_name = model_cfg.get("name") if isinstance(model_cfg, dict) else None
+    if not model_name:
+        raise ValueError(f"checkpoint config has no model.name: {checkpoint_path}")
+    if model_name == "verbalts":
+        model, _ = load_verbalts(checkpoint_path, device)
+        return model, model_name
+    config = ExperimentConfig(**config_dict)
+    config.device = str(device)
+    model = Registry.get_model(model_name)(
+        config=config,
+        learning_rate=hparams.get("learning_rate", 1e-3),
+        use_condition=hparams.get("use_condition", True),
+    )
+    model.load_state_dict(checkpoint["state_dict"], strict=True)
+    return model.to(device).eval(), model_name
 
 
 def collect_window(
@@ -137,6 +168,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ckpt-path", type=Path, required=True)
     parser.add_argument("--data-root", type=Path, default=Path("datasets/synth-u"))
     parser.add_argument("--split", choices=("train", "valid", "test"), default="train")
+    parser.add_argument(
+        "--caption-variant", default="base",
+        help="Raw-caption and precomputed-embedding variant used by the checkpoint",
+    )
     parser.add_argument("--target-layer-idx", type=int, default=1)
     parser.add_argument("--target-t-ranges", default="40-45,0-45")
     parser.add_argument("--output-dir", type=Path, required=True)
@@ -145,6 +180,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--max-samples", type=int, default=None,
         help="Optional deterministic prefix for smoke tests; omit for complete collection",
+    )
+    parser.add_argument(
+        "--load-bg-attrs",
+        action="store_true",
+        help="Load {split}_<bg-attrs-file>.npy numeric background attributes into the "
+        "batch (required for attribute-conditioned checkpoints)",
+    )
+    parser.add_argument(
+        "--bg-attrs-file",
+        default="bg_attrs",
+        help="Base name of the {split}_<name>.npy background attribute file "
+        "used with --load-bg-attrs (e.g. 'bg_attrs' or 'bg_attrs_v2')",
     )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", default="auto")
@@ -169,7 +216,14 @@ def main(argv: Sequence[str] | None = None) -> None:
     if device.type == "cuda":
         torch.cuda.manual_seed_all(args.seed)
     model, model_state_hash = load_verbalts(checkpoint_path, device)
-    full_dataset = TimeSeriesDataset(data_root, split=args.split, normalize=False)
+    full_dataset = TimeSeriesDataset(
+        data_root,
+        split=args.split,
+        normalize=False,
+        caption_variant=args.caption_variant,
+        load_bg_attrs=args.load_bg_attrs,
+        bg_attrs_filename=args.bg_attrs_file,
+    )
     if args.max_samples is not None:
         if args.max_samples < 1:
             raise ValueError("max-samples must be positive")
@@ -187,6 +241,8 @@ def main(argv: Sequence[str] | None = None) -> None:
         "model_state_sha256": model_state_hash,
         "data_root": str(data_root),
         "split": args.split,
+        "caption_variant": args.caption_variant,
+        "load_bg_attrs": bool(args.load_bg_attrs),
         "dataset_size": len(dataset),
         "full_split_size": len(full_dataset),
         "target_layer": args.target_layer_idx,

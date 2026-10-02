@@ -1,5 +1,6 @@
 # Byte-compiled / cache
 __pycache__/
+**/__pycache__/
 *.py[cod]
 *.egg-info/
 
@@ -15,19 +16,39 @@ htmlcov/
 
 # Large external assets (see README for download instructions)
 datasets/
+!contsg/data/datasets/
+!contsg/data/datasets/**
 checkpoints/
 artifacts/
+*.tar
+*.tar.gz
+*.tgz
+*.zip
+*.npz
+*.npy
+*.pt
+*.pth
+*.ckpt
+*.png
+*.jpg
+*.jpeg
+*.pdf
 
-# Experiment outputs (only retained model weights are versioned)
+# Experiment outputs/results are local only
 results/*
-!results/sae_retrain/
-!results/sae_retrain/**
-!results/*.md
 
 # Logs
 *.log
+*.err
+*.out
 slurm_log/
 slurm-*.out
+
+# Local generated visualizations / outputs
+outputs/
+
+# Cluster submission scripts are local experiment launchers
+*.slurm
 
 # Editors / OS
 .idea/

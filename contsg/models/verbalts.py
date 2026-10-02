@@ -645,6 +645,42 @@ class VerbalTSCore(nn.Module):
 # VerbalTS Lightning Module
 # =============================================================================
 
+class AttributeEncoder(nn.Module):
+    """Encode numeric attribute vectors into the condition embedding space.
+
+    Inputs are fixed-width numeric vectors (e.g. background statistics + one-hot
+    groups). The encoder maps them to the same dimension as the text projector
+    output so both conditions can be fused with ``sum`` or ``concat``.
+    """
+
+    def __init__(
+        self,
+        input_dim: int,
+        output_dim: int,
+        hidden_dim: int = 256,
+        dropout: float = 0.0,
+    ):
+        super().__init__()
+        if input_dim < 1 or output_dim < 1:
+            raise ValueError("attribute encoder dimensions must be positive")
+        self.input_dim = input_dim
+        self.output_dim = output_dim
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, output_dim),
+        )
+
+    def forward(self, attrs: torch.Tensor) -> torch.Tensor:
+        """Map (B, A) attribute vectors to (B, D) condition embeddings."""
+        if attrs.dim() != 2 or attrs.shape[1] != self.input_dim:
+            raise ValueError(
+                f"expected attributes (B, {self.input_dim}), got {tuple(attrs.shape)}"
+            )
+        return self.net(attrs)
+
+
 @Registry.register_model("verbalts", aliases=["vts"])
 class VerbalTSModule(BaseGeneratorModule, DiffusionMixin):
     """VerbalTS: Multi-view noise estimation with adaLN for text-conditioned generation.
@@ -671,6 +707,15 @@ class VerbalTSModule(BaseGeneratorModule, DiffusionMixin):
     """
 
     SUPPORTED_STAGES = ["finetune"]
+
+    @staticmethod
+    def combine_cfg(
+        conditional: torch.Tensor, unconditional: torch.Tensor, scale: float
+    ) -> torch.Tensor:
+        """Classifier-free guidance: eps_u + s * (eps_c - eps_u)."""
+        if scale < 0:
+            raise ValueError("CFG scale must be non-negative")
+        return unconditional + scale * (conditional - unconditional)
 
     def _build_model(self) -> None:
         """Build VerbalTS architecture."""
@@ -777,6 +822,11 @@ class VerbalTSModule(BaseGeneratorModule, DiffusionMixin):
         self.cond_projector = None
         self.cond_projector_type = None
         self.text_embedding_key = cond_cfg.text.embedding_key
+        self.attr_encoder: Optional[AttributeEncoder] = None
+        self.condition_dropout = float(getattr(cond_cfg, "condition_dropout", 0.0))
+        self.cfg_scale = float(getattr(cond_cfg.text, "cfg_scale", 1.0))
+        self.cond_fusion = getattr(cond_cfg, "fusion", "concat")
+        self.attr_fusion_proj: Optional[nn.Linear] = None
         if self.use_condition:
             if cond_cfg.text.enabled:
                 text_dim = cond_cfg.text.input_dim
@@ -803,6 +853,78 @@ class VerbalTSModule(BaseGeneratorModule, DiffusionMixin):
                         for _ in range(model_config["multipatch_num"])
                     ])
                     self.cond_projector_type = "linear"
+
+            attr_cfg = getattr(cond_cfg, "attribute", None)
+            if attr_cfg is not None and attr_cfg.enabled:
+                if getattr(attr_cfg, "continuous_dim", 0) < 1:
+                    raise ValueError(
+                        "condition.attribute.continuous_dim must be positive when "
+                        "the attribute condition is enabled"
+                    )
+                attr_out = getattr(attr_cfg, "output_dim", None) or cfg.channels
+                self.attr_encoder = AttributeEncoder(
+                    input_dim=attr_cfg.continuous_dim,
+                    output_dim=attr_out,
+                    dropout=getattr(attr_cfg, "dropout", 0.0),
+                )
+                if self.cond_fusion == "concat" and self.cond_projector is not None:
+                    text_out = (
+                        getattr(cond_cfg.text, "output_dim", None) or cfg.channels
+                    )
+                    self.attr_fusion_proj = nn.Linear(text_out + attr_out, text_out)
+
+    def _apply_condition_dropout(
+        self,
+        text_embedding: Optional[torch.Tensor],
+    ) -> Optional[torch.Tensor]:
+        """Drop the text condition independently for each sample."""
+        if not self.training or self.condition_dropout <= 0:
+            return text_embedding
+        if text_embedding is None:
+            return None
+        keep = (
+            torch.rand(text_embedding.shape[0], device=text_embedding.device)
+            >= self.condition_dropout
+        )
+        if text_embedding is not None:
+            text_embedding = text_embedding * keep.reshape(
+                (-1,) + (1,) * (text_embedding.ndim - 1)
+            )
+        return text_embedding
+
+    def _fuse_attribute(
+        self, attr_emb: Optional[torch.Tensor], attr_bg: torch.Tensor
+    ) -> torch.Tensor:
+        """Fuse the numeric attribute embedding into the text condition.
+
+        ``attr_emb`` is (B, n_var, n_scale, D_text) or None; ``attr_bg`` is
+        (B, D_attr). The attribute branch broadcasts over the (n_var, n_scale)
+        grid, so fusion shapes stay identical to the text-only path.
+        """
+        if self.attr_encoder is None:
+            return attr_emb
+        if attr_bg.dim() != 2:
+            raise ValueError(f"expected bg_attrs (B, A), got {tuple(attr_bg.shape)}")
+        batch_size = attr_bg.shape[0]
+        if attr_emb is None:
+            n_var = self.config.data.n_var
+            n_scale = self.config.model.multipatch_num if hasattr(
+                self.config.model, "multipatch_num"
+            ) else self.verbalts.multipatch_num
+            attr_emb = torch.zeros(
+                batch_size, n_var, n_scale, self.attr_encoder.output_dim,
+                device=attr_bg.device,
+            )
+        if self.cond_fusion == "concat":
+            if self.attr_fusion_proj is None:
+                raise ValueError("concat fusion requires attr_fusion_proj")
+            expanded = attr_bg[:, None, None, :].expand(
+                batch_size, attr_emb.shape[1], attr_emb.shape[2], -1
+            )
+            return self.attr_fusion_proj(torch.cat([attr_emb, expanded], dim=-1))
+        if self.cond_fusion == "sum":
+            return attr_emb + attr_bg[:, None, None, :]
+        raise ValueError(f"unsupported condition fusion: {self.cond_fusion!r}")
 
     def _project_text_condition(
         self,
@@ -870,14 +992,22 @@ class VerbalTSModule(BaseGeneratorModule, DiffusionMixin):
             if self.text_embedding_key in batch:
                 cap_emb = batch[self.text_embedding_key].float()
                 attr_emb = self._project_text_condition(cap_emb, diffusion_step=t)
+        if self.attr_encoder is not None:
+            if "bg_attrs" not in batch:
+                raise ValueError(
+                    "attribute condition is enabled but the batch has no 'bg_attrs'; "
+                    "check that the datamodule loads {split}_bg_attrs.npy"
+                )
+            attr_bg = self.attr_encoder(batch["bg_attrs"].float())
+            attr_emb = self._fuse_attribute(attr_emb, attr_bg)
+        attr_emb = self._apply_condition_dropout(attr_emb)
 
         # Predict noise
         pred_noise, _ = self.verbalts(noisy_ts, tp, attr_emb, t)
 
         # Compute loss
-        loss = F.mse_loss(pred_noise, noise.squeeze(1))
-
-        return {"loss": loss}
+        diffusion_loss = F.mse_loss(pred_noise, noise.squeeze(1))
+        return {"loss": diffusion_loss, "diffusion_loss": diffusion_loss}
 
     @torch.no_grad()
     def generate(
@@ -898,6 +1028,17 @@ class VerbalTSModule(BaseGeneratorModule, DiffusionMixin):
 
         Returns:
             Generated samples (n_samples, B, L, C)
+
+        Kwargs:
+            tp: Optional time positions (B, L).
+            bg_attrs: Optional numeric attribute vectors (B, A) required when
+                the attribute condition is enabled.
+            guidance_scale: CFG scale; defaults to condition.text.cfg_scale.
+            dynamic_threshold: Optional positive absolute data scale used to
+                stabilize DDIM x0 predictions. Predictions whose requested
+                absolute quantile exceeds this scale are rescaled per sample.
+            dynamic_threshold_quantile: Per-sample absolute x0 quantile used
+                by dynamic thresholding (default: 0.995).
         """
         B = condition.shape[0]
         device = condition.device
@@ -909,9 +1050,35 @@ class VerbalTSModule(BaseGeneratorModule, DiffusionMixin):
             seq_len = self.config.data.seq_length
             tp = torch.arange(seq_len, device=device).unsqueeze(0).expand(B, -1).float()
 
+        bg_attrs = kwargs.get("bg_attrs")
+        guidance_scale = float(kwargs.get("guidance_scale", self.cfg_scale))
+        trace_callback = kwargs.get("trace_callback")
+        dynamic_threshold = kwargs.get("dynamic_threshold")
+        dynamic_threshold_quantile = float(
+            kwargs.get("dynamic_threshold_quantile", 0.995)
+        )
+        if guidance_scale < 0:
+            raise ValueError("guidance_scale must be non-negative")
+        if dynamic_threshold is not None:
+            dynamic_threshold = float(dynamic_threshold)
+            if dynamic_threshold <= 0:
+                raise ValueError("dynamic_threshold must be positive")
+            if not 0 < dynamic_threshold_quantile <= 1:
+                raise ValueError(
+                    "dynamic_threshold_quantile must be in the interval (0, 1]"
+                )
+        if self.attr_encoder is not None and bg_attrs is None:
+            raise ValueError(
+                "attribute condition is enabled but generate() received no bg_attrs"
+            )
+        if self.attr_encoder is not None:
+            attr_bg = self.attr_encoder(bg_attrs.float())  # (B, D)
+
         attr_emb = None
         if self.cond_projector is not None and self.cond_projector_type != "diffstep":
             attr_emb = self._project_text_condition(condition)
+        if self.attr_encoder is not None:
+            attr_emb = self._fuse_attribute(attr_emb, attr_bg)
 
         samples = []
         for _ in range(n_samples):
@@ -926,14 +1093,44 @@ class VerbalTSModule(BaseGeneratorModule, DiffusionMixin):
                 step_attr_emb = attr_emb
                 if self.cond_projector is not None and self.cond_projector_type == "diffstep":
                     step_attr_emb = self._project_text_condition(condition, diffusion_step=t)
-                pred_noise, _ = self.verbalts(x, tp, step_attr_emb, t)
+                    if self.attr_encoder is not None:
+                        step_attr_emb = self._fuse_attribute(step_attr_emb, attr_bg)
+                pred_cond, _ = self.verbalts(x, tp, step_attr_emb, t)
+                if guidance_scale == 1.0:
+                    pred_noise = pred_cond
+                else:
+                    pred_uncond, _ = self.verbalts(x, tp, None, t)
+                    pred_noise = self.combine_cfg(pred_cond, pred_uncond, guidance_scale)
                 pred_noise = pred_noise.unsqueeze(1)  # (B, 1, C, L)
 
                 # Reverse step
+                x0_pred = None
+                if trace_callback is not None:
+                    noise_coef = self.one_minus_alpha_bar_sqrt[t].view(-1, 1, 1, 1)
+                    alpha_recip = self.alpha_bar_sqrt_inverse[t].view(-1, 1, 1, 1)
+                    x0_pred = (x - noise_coef * pred_noise) * alpha_recip
                 if sampler == "ddpm":
                     x = self._ddpm_reverse(x, pred_noise, t)
                 else:
-                    x = self._ddim_reverse(x, pred_noise, t)
+                    if trace_callback is None:
+                        x = self._ddim_reverse(
+                            x,
+                            pred_noise,
+                            t,
+                            dynamic_threshold=dynamic_threshold,
+                            dynamic_threshold_quantile=dynamic_threshold_quantile,
+                        )
+                    else:
+                        x, x0_pred = self._ddim_reverse(
+                            x,
+                            pred_noise,
+                            t,
+                            return_x0=True,
+                            dynamic_threshold=dynamic_threshold,
+                            dynamic_threshold_quantile=dynamic_threshold_quantile,
+                        )
+                if trace_callback is not None:
+                    trace_callback(t_int, x, pred_noise, x0_pred)
 
             # Reshape: (B, 1, C, L) -> (B, L, C)
             x = x.squeeze(1).permute(0, 2, 1)
@@ -955,11 +1152,24 @@ class VerbalTSModule(BaseGeneratorModule, DiffusionMixin):
 
         return x_prev
 
-    def _ddim_reverse(self, x_t: torch.Tensor, pred_noise: torch.Tensor, t: torch.Tensor, eta: float = 0.0) -> torch.Tensor:
+    def _ddim_reverse(
+        self,
+        x_t: torch.Tensor,
+        pred_noise: torch.Tensor,
+        t: torch.Tensor,
+        eta: float = 0.0,
+        return_x0: bool = False,
+        dynamic_threshold: Optional[float] = None,
+        dynamic_threshold_quantile: float = 0.995,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """DDIM reverse step (deterministic when eta=0)."""
         coef1 = self.one_minus_alpha_bar_sqrt[t].view(-1, 1, 1, 1)
         coef2 = self.alpha_bar_sqrt_inverse[t].view(-1, 1, 1, 1)
         x0_pred = (x_t - coef1 * pred_noise) * coef2
+        if dynamic_threshold is not None:
+            x0_pred = self._apply_dynamic_threshold(
+                x0_pred, dynamic_threshold, dynamic_threshold_quantile
+            )
 
         t_prev = (t - 1).clamp(min=0)
         coef_prev = self.alpha_bar_sqrt_prev[t_prev].view(-1, 1, 1, 1)
@@ -977,4 +1187,30 @@ class VerbalTSModule(BaseGeneratorModule, DiffusionMixin):
         mask = (t == 0).view(-1, 1, 1, 1)
         x_prev = torch.where(mask, x0_pred, x_prev)
 
-        return x_prev
+        return (x_prev, x0_pred) if return_x0 else x_prev
+
+    @staticmethod
+    def _apply_dynamic_threshold(
+        x0_pred: torch.Tensor, data_scale: float, quantile: float = 0.995
+    ) -> torch.Tensor:
+        """Stabilize extreme x0 predictions without changing healthy samples.
+
+        This is dynamic thresholding generalized to time series whose natural
+        scale is not ``[-1, 1]``. For each sample, the requested absolute-value
+        quantile is compared with ``data_scale``. A healthy sample is returned
+        unchanged (apart from clipping rarer outliers); an unstable sample is
+        rescaled as a whole so that the quantile maps to ``data_scale``.
+        """
+        if data_scale <= 0:
+            raise ValueError("data_scale must be positive")
+        if not 0 < quantile <= 1:
+            raise ValueError("quantile must be in the interval (0, 1]")
+        flat = x0_pred.float().abs().flatten(start_dim=1)
+        sample_scale = torch.quantile(flat, quantile, dim=1)
+        floor = torch.full_like(sample_scale, float(data_scale))
+        sample_scale = torch.maximum(sample_scale, floor)
+        view_shape = (x0_pred.shape[0],) + (1,) * (x0_pred.ndim - 1)
+        sample_scale = sample_scale.view(view_shape).to(dtype=x0_pred.dtype)
+        return x0_pred.clamp(-sample_scale, sample_scale) * (
+            float(data_scale) / sample_scale
+        )

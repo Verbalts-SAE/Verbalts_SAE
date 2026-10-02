@@ -49,6 +49,9 @@ class TimeSeriesDataset(Dataset):
         normalize: bool = True,
         transform: Optional[Any] = None,
         provide_bridge_example: bool = False,
+        caption_variant: str = "base",
+        load_bg_attrs: bool = False,
+        bg_attrs_filename: str = "bg_attrs",
     ):
         """
         Initialize the dataset.
@@ -59,12 +62,19 @@ class TimeSeriesDataset(Dataset):
             normalize: Whether to normalize time series
             transform: Optional transform to apply
             provide_bridge_example: Whether to provide example TS for Bridge model
+            load_bg_attrs: Load numeric background attributes from
+                ``{split}_<bg_attrs_filename>.npy`` into the ``bg_attrs`` item field
+            bg_attrs_filename: Base name of the background attribute file
+                (e.g. "bg_attrs" or "bg_attrs_v2")
         """
         self.data_folder = Path(data_folder)
         self.split = split
         self.normalize = normalize
         self.transform = transform
         self.provide_bridge_example = provide_bridge_example
+        self.caption_variant = caption_variant
+        self.load_bg_attrs = load_bg_attrs
+        self.bg_attrs_filename = bg_attrs_filename
 
         # Load data
         self._load_data()
@@ -84,9 +94,14 @@ class TimeSeriesDataset(Dataset):
 
         # Load captions/embeddings (support multiple naming conventions)
         # Try: {split}_caps.npy, {split}_text_caps.npy
-        caps_path = self.data_folder / f"{prefix}_caps.npy"
-        if not caps_path.exists():
-            caps_path = self.data_folder / f"{prefix}_text_caps.npy"
+        if self.caption_variant != "base":
+            caps_path = self.data_folder / f"{prefix}_text_caps_{self.caption_variant}.npy"
+            if not caps_path.exists():
+                caps_path = self.data_folder / f"{prefix}_caps_{self.caption_variant}.npy"
+        else:
+            caps_path = self.data_folder / f"{prefix}_caps.npy"
+            if not caps_path.exists():
+                caps_path = self.data_folder / f"{prefix}_text_caps.npy"
         if caps_path.exists():
             self.caps = np.load(caps_path, allow_pickle=True)
         else:
@@ -97,14 +112,27 @@ class TimeSeriesDataset(Dataset):
         # 1. {split}_cap_emb.npy (simple format)
         # 2. {split}_text_caps_embeddings_*.npy (benchmark format)
         self.cap_emb = None
-        cap_emb_path = self.data_folder / f"{prefix}_cap_emb.npy"
+        embedding_suffix = "" if self.caption_variant == "base" else f"_{self.caption_variant}"
+        cap_emb_path = self.data_folder / f"{prefix}_cap_emb{embedding_suffix}.npy"
         if cap_emb_path.exists():
             self.cap_emb = np.load(cap_emb_path).astype(np.float32)
         else:
             # Search for benchmark-style embedding files
             import glob
-            pattern = str(self.data_folder / f"{prefix}_text_caps_embeddings_*.npy")
-            emb_files = sorted(glob.glob(pattern))
+            if self.caption_variant == "base":
+                patterns = [
+                    str(self.data_folder / f"{prefix}_cap_emb_*.npy"),
+                    str(self.data_folder / f"{prefix}_text_caps_embeddings_*.npy"),
+                ]
+            else:
+                patterns = [
+                    str(self.data_folder / f"{prefix}_cap_emb_{self.caption_variant}_*.npy"),
+                    str(
+                        self.data_folder
+                        / f"{prefix}_text_caps_{self.caption_variant}_embeddings_*.npy"
+                    ),
+                ]
+            emb_files = sorted({path for pattern in patterns for path in glob.glob(pattern)})
             if emb_files:
                 # Prefer 1024-dim embeddings if available
                 for f in emb_files:
@@ -121,6 +149,17 @@ class TimeSeriesDataset(Dataset):
             self.attrs = np.load(attrs_path)
         else:
             self.attrs = None
+
+        # Load numeric background attributes (optional)
+        self.bg_attrs = None
+        if self.load_bg_attrs:
+            bg_attrs_path = self.data_folder / f"{prefix}_{self.bg_attrs_filename}.npy"
+            if not bg_attrs_path.exists():
+                raise FileNotFoundError(
+                    f"background attributes missing: {bg_attrs_path} "
+                    f"(run scripts/build_morph_bg_attrs.py first)"
+                )
+            self.bg_attrs = np.load(bg_attrs_path).astype(np.float32)
 
         # Load labels (optional)
         labels_path = self.data_folder / f"{prefix}_labels.npy"
@@ -202,11 +241,18 @@ class TimeSeriesDataset(Dataset):
 
         # Add raw caption
         if self.caps is not None:
-            item["cap"] = str(self.caps[idx])
+            caption = np.asarray(self.caps[idx]).reshape(-1)
+            # Benchmark instance captions are sometimes stored as (N, 1).
+            # Preserve the historical representation for true multi-caption rows.
+            item["cap"] = str(caption[0]) if caption.size == 1 else str(self.caps[idx])
 
         # Add attributes
         if self.attrs is not None:
             item["attrs"] = torch.from_numpy(self.attrs[idx])
+
+        # Add numeric background attributes
+        if self.bg_attrs is not None:
+            item["bg_attrs"] = torch.from_numpy(self.bg_attrs[idx])
 
         # Add label
         if self.labels is not None:
@@ -326,7 +372,22 @@ class BaseDataModule(pl.LightningDataModule):
             split=split,
             normalize=self.config.normalize,
             provide_bridge_example=provide_bridge_example,
+            caption_variant=self.config.caption_variant,
+            load_bg_attrs=self._load_bg_attrs(),
+            bg_attrs_filename=self._bg_attrs_filename(),
         )
+
+    def _load_bg_attrs(self) -> bool:
+        """Whether the configured condition requires numeric background attributes."""
+        condition = self.train_config.get("condition")
+        attribute_cfg = getattr(condition, "attribute", None) if condition is not None else None
+        return bool(getattr(attribute_cfg, "enabled", False))
+
+    def _bg_attrs_filename(self) -> str:
+        """Background attribute file base name from the attribute condition config."""
+        condition = self.train_config.get("condition")
+        attribute_cfg = getattr(condition, "attribute", None) if condition is not None else None
+        return str(getattr(attribute_cfg, "bg_attrs_file", "bg_attrs") or "bg_attrs")
 
     def train_dataloader(self) -> DataLoader:
         """Create training dataloader."""
@@ -414,7 +475,10 @@ class BaseDataModule(pl.LightningDataModule):
                 "Ensure DataModule.setup(stage='fit') has been executed."
             )
         if hasattr(dataset, "caps") and dataset.caps is not None:
-            return [str(c) for c in dataset.caps]
+            captions = np.asarray(dataset.caps)
+            if captions.ndim == 2 and captions.shape[1] == 1:
+                captions = captions[:, 0]
+            return [str(c) for c in captions]
         raise RuntimeError(f"{name} requires dataset to have 'caps' attribute.")
 
     @property

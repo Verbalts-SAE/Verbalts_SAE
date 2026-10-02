@@ -27,12 +27,14 @@ SHAPE_TO_TARGET = {
 
 
 def parse_segment_shapes(caption: str) -> tuple[str, str, str]:
-    """Extract beginning/middle/end local shapes from a synth-u caption.
+    """Extract beginning/middle/end local shapes from a caption.
 
-    The retained dataset uses exactly three equivalent phrasings for each
-    stage/shape combination (for example, ``A sag at beginning area`` and
-    ``The beginning part has a sag``).  Global trend/season statements are
-    ignored.  If a stage has no local statement, its target is ``nothing``.
+    Supports two caption formats:
+    1. synth-u format: "A sag at beginning area" / "The beginning part has a sag"
+    2. morph-v2 format: "Beginning morphology: single peak." / "Middle morphology: nothing."
+
+    Global trend/season statements are ignored. If a stage has no local statement,
+    its target is ``nothing``.
     """
 
     shapes = ["nothing", "nothing", "nothing"]
@@ -44,11 +46,12 @@ def parse_segment_shapes(caption: str) -> tuple[str, str, str]:
             continue
 
         stage: int | None = None
+        # Support both synth-u and morph-v2 stage keywords
         if "beginning" in sentence or "at beginning" in sentence:
             stage = 0
         elif "middle" in sentence:
             stage = 1
-        elif "end part" in sentence or "end area" in sentence or "at end" in sentence:
+        elif "end part" in sentence or "end area" in sentence or "at end" in sentence or sentence.startswith("end"):
             stage = 2
         if stage is None:
             continue
@@ -60,6 +63,8 @@ def parse_segment_shapes(caption: str) -> tuple[str, str, str]:
             shape = "single peak"
         elif "sag" in sentence:
             shape = "sag"
+        elif "nothing" in sentence or "no shape" in sentence:
+            shape = "nothing"
         if shape is None:
             raise ValueError(f"unrecognized local-shape statement: {raw_sentence!r}")
         if stage in found and found[stage] != shape:

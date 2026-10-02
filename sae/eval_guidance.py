@@ -147,7 +147,10 @@ def load_cttp_embedder(
 ):
     """Load the released synth-u CTTP model, resolving ``${LONGCLIP_ROOT}``."""
 
-    from contsg.eval.embedder import CLIPEmbedder
+    try:
+        from contsg.eval.embedder import CLIPEmbedder
+    except Exception as exc:  # noqa: BLE001
+        return None, f"CTTP embedder import failed: {type(exc).__name__}: {exc}"
 
     if not config_path.is_file() or not checkpoint_path.is_file():
         return None, (
@@ -169,7 +172,10 @@ def load_cttp_embedder(
     local_config.write_text(resolved, encoding="utf-8")
     if not longclip_root.is_dir():
         return None, f"LongCLIP directory missing: {longclip_root}"
-    return CLIPEmbedder(local_config, checkpoint_path, device), ""
+    try:
+        return CLIPEmbedder(local_config, checkpoint_path, device), ""
+    except Exception as exc:  # noqa: BLE001
+        return None, f"CTTP embedder load failed: {type(exc).__name__}: {exc}"
 
 
 @torch.no_grad()
@@ -205,8 +211,11 @@ def generate_variant(
     condition: torch.Tensor,
     wrapper: torch.nn.Module | None,
     seed: int,
+    sampler: str = "ddim",
+    dynamic_threshold: float | None = None,
+    dynamic_threshold_quantile: float = 0.995,
 ) -> np.ndarray:
-    """Generate one DDIM curve per condition under an optional SAE wrapper.
+    """Generate one curve per condition under an optional SAE wrapper.
 
     Attaches ``wrapper`` as the VerbalTS residual activation transform (None
     restores the Pure path), seeds the global RNG state, and returns the
@@ -217,8 +226,14 @@ def generate_variant(
     torch.manual_seed(seed)
     if condition.device.type == "cuda":
         torch.cuda.manual_seed_all(seed)
-    samples = model.generate(condition, n_samples=1, sampler="ddim")[0, :, :, 0]
-    return samples.detach().cpu().float().numpy()
+    generated = model.generate(
+        condition,
+        n_samples=1,
+        sampler=sampler,
+        dynamic_threshold=dynamic_threshold,
+        dynamic_threshold_quantile=dynamic_threshold_quantile,
+    )[0, :, :, 0]
+    return generated.detach().cpu().float().numpy()
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -336,6 +351,8 @@ def generate_all_variants(
     output_dir: Path,
     device: torch.device,
     variant_keys: Sequence[str],
+    *,
+    extra_conditions: dict[str, np.ndarray] | None = None,
 ) -> dict[str, np.ndarray]:
     """Generate the paired variants chunk-by-chunk with resume support."""
 

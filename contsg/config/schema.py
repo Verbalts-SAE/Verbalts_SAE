@@ -99,6 +99,11 @@ class AttributeConditionConfig(BaseModel):
 
     enabled: bool = Field(False, description="Enable attribute conditioning")
     continuous_dim: int = Field(0, ge=0, description="Number of continuous attributes")
+    bg_attrs_file: str = Field(
+        "bg_attrs",
+        description="Base name of the {split}_<name>.npy background attribute file "
+        "loaded by the datamodule (e.g. 'bg_attrs' or 'bg_attrs_v2')",
+    )
     discrete_configs: list[dict[str, int]] = Field(
         default_factory=list,
         description="List of {'num_classes': N, 'embed_dim': D} for each discrete attribute"
@@ -125,7 +130,6 @@ class ConditionConfig(BaseModel):
     text: TextConditionConfig = Field(default_factory=lambda: TextConditionConfig())  # pyright: ignore[reportCallIssue]
     attribute: AttributeConditionConfig = Field(default_factory=lambda: AttributeConditionConfig())  # pyright: ignore[reportCallIssue]
     label: LabelConditionConfig = Field(default_factory=lambda: LabelConditionConfig())  # pyright: ignore[reportCallIssue]
-
     fusion: Literal["concat", "sum", "attention"] = Field(
         "concat", description="Multi-condition fusion strategy"
     )
@@ -230,6 +234,24 @@ class DataConfig(BaseModel):
 
     # Optional dataset-specific settings
     normalize: bool = Field(True, description="Normalize time series")
+    caption_variant: Literal[
+        "base",
+        "sparse",
+        "full",
+        "morph_explicit",
+        "compact_structured",
+        "morph_width",
+        "morph",
+        "control",
+        "morphology",
+        "positional",
+        "trend_bucket",
+        "trend_synthu",
+        "trend_synthu_nl",
+        "trend_tail_mid",
+    ] = Field(
+        "base", description="Raw caption/embedding variant to load"
+    )
     train_split: float = Field(0.8, ge=0, le=1, description="Train split ratio")
     val_split: float = Field(0.1, ge=0, le=1, description="Validation split ratio")
 
@@ -1030,14 +1052,18 @@ class ExperimentConfig(BaseModel):
         path.parent.mkdir(parents=True, exist_ok=True)
 
         # Convert to dict and handle special types
-        data = self.model_dump(mode="json", exclude_none=True)
+        # ``model`` is annotated as the extensible base ModelConfig and is
+        # replaced by model-specific subclasses during validation.  Pydantic
+        # otherwise serializes only the base fields, silently dropping (for
+        # example) every CTTP architecture parameter from experiment records.
+        data = self.model_dump(mode="json", exclude_none=True, serialize_as_any=True)
 
         with open(path, "w", encoding="utf-8") as f:
             yaml.dump(data, f, default_flow_style=False, allow_unicode=True, sort_keys=False)
 
     def model_dump_yaml(self) -> str:
         """Dump configuration as YAML string."""
-        data = self.model_dump(mode="json", exclude_none=True)
+        data = self.model_dump(mode="json", exclude_none=True, serialize_as_any=True)
         return yaml.dump(data, default_flow_style=False, allow_unicode=True, sort_keys=False)
 
 

@@ -123,9 +123,23 @@ class LatentClassifierGuidanceWrapper(TimestepSAEWrapper):
         full_strength_shapes: str = "",
         topk: int = 0,
         topk_mode: str = "global",
+        active_only: bool = False,
         allowed_dims: Sequence[int] | None = None,
+        batch_invariant: bool = False,
+        objective_head_indices: Sequence[int] | None = None,
+        objective_head_weights: Sequence[float] | None = None,
+        objective_class_weights: Sequence[float] | None = None,
+        guidance_t_range: Tuple[int, int] | None = None,
+        allowed_tokens: Sequence[int] | None = None,
+        diagnostic_trace: bool = False,
+        selection_score: str = "gradient",
+        preserve_residual: bool = False,
     ) -> None:
         super().__init__(sae, t_range)
+        if selection_score not in ("gradient", "applied"):
+            raise ValueError("selection_score must be gradient or applied")
+        self.selection_score = selection_score
+        self.preserve_residual = preserve_residual
         if eta <= 0.0:
             raise ValueError("guidance eta must be positive")
         if rel_cap <= 0.0 or max_step <= 0.0:
@@ -138,6 +152,17 @@ class LatentClassifierGuidanceWrapper(TimestepSAEWrapper):
             raise ValueError("topk must not exceed the SAE latent dimension")
         if topk_mode not in ("global", "dynamic"):
             raise ValueError(f"unknown topk_mode {topk_mode!r}")
+        if guidance_t_range is None:
+            guidance_t_range = t_range
+        guidance_t_range = tuple(int(value) for value in guidance_t_range)
+        # An inverted range (min > max) disables the guidance step: the SAE
+        # reconstruction stays active over t_min..t_max but the selected
+        # guidance mask is empty.
+        if len(guidance_t_range) != 2:
+            raise ValueError("guidance_t_range must be a (minimum, maximum) pair")
+        if guidance_t_range[0] < self.t_min or guidance_t_range[1] > self.t_max:
+            raise ValueError("guidance_t_range must be contained in the SAE reconstruction range")
+        self.guidance_t_min, self.guidance_t_max = guidance_t_range
         # Optional hard restriction of the guidance step to a fixed subset
         # of latent dimensions (e.g. a frequency band or a hand-picked
         # feature set).  None keeps the full dense gradient.  When set, the
@@ -155,13 +180,89 @@ class LatentClassifierGuidanceWrapper(TimestepSAEWrapper):
             self.register_buffer(
                 "allowed_mask", torch.empty((0,), dtype=torch.float32)
             )
+        if allowed_tokens is not None:
+            tokens_per_sample = getattr(classifier, "tokens_per_sample", None)
+            if tokens_per_sample is None:
+                raise TypeError("allowed_tokens requires classifier.tokens_per_sample")
+            tokens = tuple(dict.fromkeys(int(token) for token in allowed_tokens))
+            if not tokens or min(tokens) < 0 or max(tokens) >= int(tokens_per_sample):
+                raise ValueError(
+                    f"allowed_tokens out of range for {tokens_per_sample} tokens per sample"
+                )
+            token_mask = torch.zeros(int(tokens_per_sample), dtype=torch.float32)
+            token_mask[list(tokens)] = 1.0
+            self.register_buffer("allowed_token_mask", token_mask)
+        else:
+            self.register_buffer(
+                "allowed_token_mask", torch.empty((0,), dtype=torch.float32)
+            )
         self.classifier = classifier
+        self.diagnostic_trace = diagnostic_trace
+        self.trace_records = []
         self.eta = float(eta)
         self.rel_cap = float(rel_cap)
         self.max_step = float(max_step)
         self.iters = int(iters)
         self.topk = int(topk)
         self.topk_mode = topk_mode
+        # Restrict the guidance step to latents that are ACTIVE in the current
+        # token (z > 1e-6).  The classifier standardizes by input_std, so
+        # dead latents (z=0, tiny sigma) produce exploding gradients that
+        # dominate the per-token top-k ranking while their sigma cap keeps
+        # their actual move negligible; selecting them wastes the top-k budget
+        # and perturbs decoder directions that carry no information.
+        self.active_only = bool(active_only)
+        # Historical guidance averages over the entire batch, so its effective
+        # per-sample dose scales as 1 / batch_size.  Keep that behavior by
+        # default for reproducibility; new evaluations can sum per-sample
+        # objectives to make eta independent of generation batch size.
+        self.batch_invariant = bool(batch_invariant)
+        # Keep the historical all-head reduction as the default execution
+        # path.  A non-empty subset zeros inactive head losses while retaining
+        # the original head-count denominator, so masking a head removes its
+        # contribution without renormalizing (and increasing) the remaining
+        # heads' dose.
+        if objective_head_indices is None:
+            self.register_buffer(
+                "objective_head_indices", torch.empty((0,), dtype=torch.long)
+            )
+        else:
+            head_indices = tuple(dict.fromkeys(int(index) for index in objective_head_indices))
+            if not head_indices or min(head_indices) < 0:
+                raise ValueError("objective_head_indices must be non-empty and non-negative")
+            self.register_buffer(
+                "objective_head_indices", torch.tensor(head_indices, dtype=torch.long)
+            )
+        # Optional per-head multiplicative weights applied AFTER the 0/1
+        # objective-head mask so per-stage dose can be graded (e.g. a weak
+        # beginning/end dose plus a full middle dose) instead of binary.
+        if objective_head_weights is None:
+            self.register_buffer(
+                "objective_head_weights", torch.empty((0,), dtype=torch.float32)
+            )
+        else:
+            weights = tuple(float(value) for value in objective_head_weights)
+            if not weights or min(weights) < 0.0:
+                raise ValueError("objective_head_weights must be non-empty and non-negative")
+            self.register_buffer(
+                "objective_head_weights", torch.tensor(weights, dtype=torch.float32)
+            )
+        # Optional per-class multiplicative weights applied to the objective
+        # loss of each segment head based on the TARGET class of that segment
+        # (e.g. weighting PVC targets x2 to compensate a hard class).  The
+        # weight tensor is indexed by the gathered target class per head, so
+        # its length must match the classifier's class count.
+        if objective_class_weights is None:
+            self.register_buffer(
+                "objective_class_weights", torch.empty((0,), dtype=torch.float32)
+            )
+        else:
+            class_weights = tuple(float(value) for value in objective_class_weights)
+            if not class_weights or min(class_weights) < 0.0:
+                raise ValueError("objective_class_weights must be non-empty and non-negative")
+            self.register_buffer(
+                "objective_class_weights", torch.tensor(class_weights, dtype=torch.float32)
+            )
         # Confidence-weighted guidance: per-segment loss is scaled by
         # (1 - p_target)^adaptive_gamma so segments the classifier already
         # gets right receive little perturbation.  Segments whose target
@@ -184,8 +285,8 @@ class LatentClassifierGuidanceWrapper(TimestepSAEWrapper):
         # Optional sparse truncation of the guidance step.
         # "global": restrict to the top-k latents of the classifier's
         # per-shape composite weight (a FIXED feature set per shape).
-        # "dynamic": per-token top-k of the current gradient (the state's
-        # own selection set).  topk=0 keeps the dense gradient.
+        # "dynamic": per-token top-k of the current absolute gradient (the
+        # state's own selection set).  topk=0 keeps the dense gradient.
         if self.topk > 0 and self.topk_mode == "global":
             win = classifier.token_projection.weight.detach()
             wout = classifier.output.weight.detach()
@@ -202,8 +303,30 @@ class LatentClassifierGuidanceWrapper(TimestepSAEWrapper):
             )
         initial = torch.empty((0,), dtype=torch.long)
         self.register_buffer("target_classes", initial)
+        self._reset_guidance_audit()
+
+    def _reset_guidance_audit(self) -> None:
+        """Reset guidance-only dose diagnostics without changing the intervention."""
+
+        self.trace_records = []
         self.guidance_rows = 0
+        self.guidance_gradient_abs_sum = 0.0
         self.guidance_step_sum = 0.0
+        self.guidance_pre_cap_step_sum = 0.0
+        self.guidance_cap_hits = 0
+        self.guidance_selected_cap_rows = 0
+        self.guidance_selected_cap_hits = 0
+        self.guidance_applied_rows = 0
+        self.guidance_applied_nonzero = 0
+        self.guidance_applied_max_nonzero_per_token = 0
+        self.guidance_applied_step_sum = 0.0
+        self.guidance_applied_standardized_step_sum = 0.0
+
+    def reset_audit(self) -> None:
+        """Reset both SAE-hook and guidance-dose audit counters."""
+
+        super().reset_audit()
+        self._reset_guidance_audit()
 
     def set_targets(self, target_classes: torch.Tensor) -> None:
         """Set targets shaped ``(batch,)`` or legacy ``(batch, heads)``."""
@@ -224,11 +347,50 @@ class LatentClassifierGuidanceWrapper(TimestepSAEWrapper):
             raise ValueError(f"target class indices must be in [0, {num_classes - 1}]")
         self.target_classes = values.detach().clone()
 
-    def audit(self) -> dict[str, float | int]:
+    def audit(self) -> dict[str, float | int | bool]:
         report = super().audit()
         report["guidance_rows"] = self.guidance_rows
+        report["guidance_raw_gradient_mean_abs"] = (
+            self.guidance_gradient_abs_sum / max(self.guidance_rows, 1)
+        )
         report["guidance_mean_abs_step"] = self.guidance_step_sum / max(
             self.guidance_rows, 1
+        )
+        report["guidance_pre_cap_mean_abs_step"] = (
+            self.guidance_pre_cap_step_sum / max(self.guidance_rows, 1)
+        )
+        report["guidance_cap_fraction"] = self.guidance_cap_hits / max(
+            self.guidance_rows, 1
+        )
+        report["guidance_selected_cap_fraction"] = (
+            self.guidance_selected_cap_hits
+            / max(self.guidance_selected_cap_rows, 1)
+        )
+        report["guidance_applied_mean_abs_step"] = (
+            self.guidance_applied_step_sum / max(self.guidance_applied_rows, 1)
+        )
+        report["guidance_applied_nonzero_fraction"] = (
+            self.guidance_applied_nonzero / max(self.guidance_applied_rows, 1)
+        )
+        report["guidance_topk"] = self.topk
+        report["guidance_active_only"] = self.active_only
+        report["guidance_applied_max_nonzero_per_token"] = (
+            self.guidance_applied_max_nonzero_per_token
+        )
+        report["guidance_applied_nonzero_mean_abs_step"] = (
+            self.guidance_applied_step_sum / max(self.guidance_applied_nonzero, 1)
+        )
+        report["guidance_applied_mean_abs_step_over_sigma"] = (
+            self.guidance_applied_standardized_step_sum
+            / max(self.guidance_applied_rows, 1)
+        )
+        report["batch_invariant"] = self.batch_invariant
+        report["guidance_t_min"] = self.guidance_t_min
+        report["guidance_t_max"] = self.guidance_t_max
+        report["guidance_token_count"] = (
+            int(self.allowed_token_mask.sum())
+            if self.allowed_token_mask.numel() > 0
+            else int(getattr(self.classifier, "tokens_per_sample", 0))
         )
         return report
 
@@ -236,6 +398,8 @@ class LatentClassifierGuidanceWrapper(TimestepSAEWrapper):
         self, hidden: torch.Tensor, diffusion_step: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
         transformed, latents = super().forward(hidden, diffusion_step)
+        if self.preserve_residual:
+            transformed = hidden.clone()
         steps = torch.as_tensor(diffusion_step, device=hidden.device).long().flatten()
         if self.target_classes.shape[0] != steps.numel():
             raise ValueError(
@@ -243,7 +407,9 @@ class LatentClassifierGuidanceWrapper(TimestepSAEWrapper):
                 f"{self.target_classes.shape[0]} != {steps.numel()}"
             )
         tokens_per_sample = hidden.shape[0] // steps.numel()
-        selected = (steps >= self.t_min) & (steps <= self.t_max)
+        # SAE reconstruction remains active over self.t_min..self.t_max; only
+        # the causal guidance delta is restricted by this independent window.
+        selected = (steps >= self.guidance_t_min) & (steps <= self.guidance_t_max)
         if selected.any():
             sample_latents = latents.view(steps.numel(), tokens_per_sample, -1)[
                 selected
@@ -292,41 +458,173 @@ class LatentClassifierGuidanceWrapper(TimestepSAEWrapper):
                             weights = torch.where(
                                 full_mask, torch.ones_like(weights), weights
                             )
-                        loss = -(target_log_probs * weights).mean()
+                        losses = -(target_log_probs * weights)
                     else:
-                        loss = -target_log_probs.mean()
+                        losses = -target_log_probs
+                    if self.objective_head_indices.numel() > 0:
+                        if losses.ndim != 2 or int(self.objective_head_indices.max()) >= losses.shape[1]:
+                            raise ValueError(
+                                "objective head mask/classifier output mismatch: "
+                                f"losses={tuple(losses.shape)}, "
+                                f"indices={self.objective_head_indices.tolist()}"
+                            )
+                        head_mask = losses.new_zeros(losses.shape[1])
+                        head_mask[self.objective_head_indices] = 1.0
+                        losses = losses * head_mask
+                    if self.objective_head_weights.numel() > 0:
+                        if losses.ndim != 2 or self.objective_head_weights.numel() != losses.shape[1]:
+                            raise ValueError(
+                                "objective head weights/classifier output mismatch: "
+                                f"losses={tuple(losses.shape)}, "
+                                f"weights={self.objective_head_weights.tolist()}"
+                            )
+                        losses = losses * self.objective_head_weights.to(losses.device)
+                    if self.objective_class_weights.numel() > 0:
+                        if int(targets.max()) >= self.objective_class_weights.numel():
+                            raise ValueError(
+                                "objective class weights/classifier output mismatch: "
+                                f"targets up to {int(targets.max())}, "
+                                f"weights={self.objective_class_weights.tolist()}"
+                            )
+                        class_w = self.objective_class_weights.to(losses.device)[targets]
+                        losses = losses * class_w
+                    if self.batch_invariant:
+                        loss = losses.reshape(losses.shape[0], -1).mean(dim=1).sum()
+                    else:
+                        loss = losses.mean()
                     (grad,) = torch.autograd.grad(loss, leaf)
-                delta = torch.nan_to_num(self.eta * grad).clamp(
+                self.guidance_gradient_abs_sum += float(
+                    grad.detach().abs().sum().cpu()
+                )
+                scaled_grad = torch.nan_to_num(self.eta * grad)
+                cap_view = caps.view(1, 1, -1)
+                delta = scaled_grad.clamp(
                     -caps.view(1, 1, -1), caps.view(1, 1, -1)
+                )
+                self.guidance_pre_cap_step_sum += float(
+                    scaled_grad.detach().abs().sum().cpu()
+                )
+                self.guidance_cap_hits += int(
+                    (scaled_grad.detach().abs() > cap_view).sum().cpu()
                 )
                 if self.allowed_mask.numel() > 0:
                     delta = delta * self.allowed_mask.to(delta.device)
+                if self.allowed_token_mask.numel() > 0:
+                    delta = delta * self.allowed_token_mask.to(delta.device).view(1, -1, 1)
+                if self.active_only:
+                    # Dead latents never move under active-only steering.
+                    active_mask = sample_latents.detach() > 1e-6
+                    delta = delta * active_mask.to(delta.dtype)
                 current = torch.clamp_min(leaf.detach() - delta, 0.0)
                 self.guidance_rows += int(delta.numel())
                 self.guidance_step_sum += float(delta.detach().abs().sum().cpu())
             stepped = current
+            selected_mask = torch.ones_like(grad, dtype=torch.bool)
+            active_mask = (
+                (sample_latents.detach() > 1e-6)
+                if self.active_only else None
+            )
             if self.topk > 0:
                 if self.topk_mode == "global":
                     target_for_mask = targets if targets.ndim == 1 else targets[:, 1]
                     mask = self.global_topk_mask[
                         target_for_mask
                     ].unsqueeze(1)  # [B_sel, 1, D]
+                    if self.active_only:
+                        mask = mask & active_mask
+                    selected_mask = mask.expand_as(stepped)
                     stepped = torch.where(
-                        mask.expand_as(stepped), stepped, sample_latents.detach()
+                        selected_mask, stepped, sample_latents.detach()
                     )
-                else:  # dynamic per-token top-k of |stepped - original|
-                    step_mag = (stepped - sample_latents.detach()).abs()
-                    topk_idx = step_mag.topk(
-                        self.topk, dim=-1
-                    ).indices  # [B_sel, T, k]
-                    mask = torch.zeros_like(step_mag, dtype=torch.bool)
+                else:  # dynamic per-token top-k of the current |gradient|
+                    gradient_magnitude = grad.detach().abs()
+                    if self.selection_score == "applied":
+                        gradient_magnitude = (stepped - sample_latents.detach()).abs()
+                    if self.active_only:
+                        # Exclude dead latents from the ranking so the top-k
+                        # budget is spent on latents that can actually move.
+                        gradient_magnitude = gradient_magnitude.masked_fill(
+                            ~active_mask, float("-inf")
+                        )
+                        min_active = int(active_mask.sum(-1).min().item())
+                        k_eff = min(self.topk, min_active)
+                    else:
+                        k_eff = self.topk
+                    topk_idx = gradient_magnitude.topk(
+                        k_eff, dim=-1
+                    ).indices  # [B_sel, T, k_eff]
+                    mask = torch.zeros_like(gradient_magnitude, dtype=torch.bool)
                     mask.scatter_(-1, topk_idx, True)
+                    selected_mask = mask
                     stepped = torch.where(
                         mask, stepped, sample_latents.detach()
                     )
+            selected_cap_hits = scaled_grad.detach().abs() > cap_view
+            self.guidance_selected_cap_rows += int(selected_mask.sum().cpu())
+            self.guidance_selected_cap_hits += int(
+                (selected_cap_hits & selected_mask).sum().cpu()
+            )
+            applied_step = stepped - sample_latents.detach()
+            if self.diagnostic_trace:
+                with torch.no_grad():
+                    before = self.classifier(sample_latents.float()).softmax(-1)
+                    after = self.classifier(stepped.float()).softmax(-1)
+                    pb = before.gather(-1, targets.unsqueeze(-1)).squeeze(-1)
+                    pa = after.gather(-1, targets.unsqueeze(-1)).squeeze(-1)
+                    # Compare both round trips: encode(decode(z)) is not z,
+                    # even without guidance. Keep this observational only.
+                    decoded_before = self.sae.decode(sample_latents.detach())
+                    decoded_after = self.sae.decode(stepped.detach())
+                    roundtrip_before = self.sae.encode(decoded_before)
+                    roundtrip_after = self.sae.encode(decoded_after)
+                    prb = self.classifier(roundtrip_before.float()).softmax(-1).gather(
+                        -1, targets.unsqueeze(-1)).squeeze(-1)
+                    pra = self.classifier(roundtrip_after.float()).softmax(-1).gather(
+                        -1, targets.unsqueeze(-1)).squeeze(-1)
+                    hidden_delta = decoded_after - decoded_before
+                    hidden_scale = self.sae.sigma_h + self.sae.epsilon
+                    input_hidden = hidden.view(steps.numel(), tokens_per_sample, -1)[selected]
+                    batch_rows = selected.nonzero(as_tuple=True)[0].tolist()
+                    for j, timestep in enumerate(steps[selected].tolist()):
+                        mask_j = selected_mask[j]
+                        count = max(int(mask_j.sum()), 1)
+                        self.trace_records.append(dict(
+                            timestep=timestep, target=targets[j].tolist(),
+                            batch_row=batch_rows[j],
+                            probability_before=pb[j].tolist(), probability_after=pa[j].tolist(),
+                            probability_roundtrip_before=prb[j].tolist(),
+                            probability_roundtrip_after=pra[j].tolist(),
+                            latent_delta_rmse=float(applied_step[j].square().mean().sqrt()),
+                            roundtrip_latent_delta_rmse=float((roundtrip_after[j] - roundtrip_before[j]).square().mean().sqrt()),
+                            hidden_delta_rmse=float(hidden_delta[j].square().mean().sqrt()),
+                            hidden_delta_standardized_rmse=float((hidden_delta[j] / hidden_scale).square().mean().sqrt()),
+                            hidden_delta_relative_l2=float(hidden_delta[j].norm() / decoded_before[j].norm().clamp_min(1e-12)),
+                            hidden_reconstruction_rmse=float((decoded_before[j] - input_hidden[j]).square().mean().sqrt()),
+                            prediction_before=before[j].argmax(-1).tolist(),
+                            selected_cap_fraction=float((selected_cap_hits[j] & mask_j).sum()) / count,
+                            selected_dead_fraction=float(((sample_latents[j] <= 1e-6) & mask_j).sum()) / count,
+                            selected_relu_clip_fraction=float(((sample_latents[j] - delta[j] < 0) & mask_j).sum()) / count,
+                            selected_zero_move_fraction=float(((applied_step[j] == 0) & mask_j).sum()) / count,
+                            applied_mean_abs=float(applied_step[j].abs().mean()),
+                        ))
+            self.guidance_applied_rows += int(applied_step.numel())
+            self.guidance_applied_nonzero += int((applied_step != 0).sum().cpu())
+            self.guidance_applied_max_nonzero_per_token = max(
+                self.guidance_applied_max_nonzero_per_token,
+                int((applied_step != 0).sum(dim=-1).max().cpu()),
+            )
+            self.guidance_applied_step_sum += float(
+                applied_step.detach().abs().sum().cpu()
+            )
+            self.guidance_applied_standardized_step_sum += float(
+                (applied_step.detach().abs() / sigma.view(1, 1, -1)).sum().cpu()
+            )
             steered_rows = stepped.reshape(-1, stepped.shape[-1])
             row_selected = selected.repeat_interleave(tokens_per_sample)
             transformed[row_selected] = self.sae.decode(steered_rows)
+            if self.preserve_residual:
+                transformed[row_selected] += hidden[row_selected] - self.sae.decode(
+                    sample_latents.reshape(-1, sample_latents.shape[-1]))
             latents[row_selected] = steered_rows
         return transformed, latents
 
